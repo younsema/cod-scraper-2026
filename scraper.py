@@ -98,6 +98,25 @@ def detect_platform(html_text: str, url: str) -> str:
     return "Unknown"
 
 
+_CURRENCY_PATTERNS = [
+    re.compile(r'Shopify\.currency\s*=\s*\{\s*"active"\s*:\s*"([A-Z]{3})"'),
+    re.compile(r'"?currency"?\s*[:=]\s*"([A-Z]{3})"'),
+    re.compile(r'contentCurrency["\']?\s*[:=]\s*["\']([A-Z]{3})["\']'),
+]
+
+
+def _detect_currency_from_html(html_text: str):
+    """
+    كنحاولو نلقاو العملة الحقيقية ديال المتجر من الصفحة (Shopify.currency,
+    meta tags، إلخ) بدل ما نفترضو عملة ثابتة لكل المتاجر.
+    """
+    for pattern in _CURRENCY_PATTERNS:
+        match = pattern.search(html_text)
+        if match:
+            return match.group(1)
+    return None
+
+
 def _is_single_product_url(url: str) -> bool:
     """
     كنحددو واش الرابط كايشير لـ صفحة منتج واحد بالضبط
@@ -196,17 +215,21 @@ def scrape_single_product(url: str) -> dict:
         match = re.search(r"[\d]+([.,]\d+)?", str(price_raw))
         price_clean = match.group(0) if match else str(price_raw)
 
+    currency = data.get("currency") or _detect_currency_from_html(resp.text) or DEFAULT_CURRENCY
+
     return {
         "title": (data.get("title") or "").strip(),
         "price": price_clean or "",
-        "currency": data.get("currency") or DEFAULT_CURRENCY,
+        "currency": currency,
         "image": urljoin(url, data.get("image")) if data.get("image") else "",
         "url": url,
         "source": platform,
     }
 
 
-def get_shopify_products_json(store_url: str, max_products: int = 250) -> list:
+def get_shopify_products_json(
+    store_url: str, max_products: int = 250, currency: str = DEFAULT_CURRENCY
+) -> list:
     """
     كنستعملو الـ endpoint العمومي ديال Shopify: /products.json
     كايخدم مع أي متجر Shopify بدون الحاجة لمفتاح API.
@@ -253,7 +276,7 @@ def get_shopify_products_json(store_url: str, max_products: int = 250) -> list:
                 {
                     "title": title,
                     "price": price,
-                    "currency": DEFAULT_CURRENCY,
+                    "currency": currency,
                     "image": image,
                     "url": product_url,
                     "source": "Shopify",
@@ -311,8 +334,11 @@ def scrape_store(url: str, max_products: int = 60, progress_callback=None) -> li
 
     # 2) إلا كان Shopify (رابط متجر / كولكسيون) -> نجربو /products.json مباشرة
     if platform == "Shopify":
+        store_currency = _detect_currency_from_html(resp.text) or DEFAULT_CURRENCY
         try:
-            products = get_shopify_products_json(url, max_products=max_products)
+            products = get_shopify_products_json(
+                url, max_products=max_products, currency=store_currency
+            )
             if products:
                 return products
         except ScrapeError:

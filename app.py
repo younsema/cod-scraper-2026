@@ -103,11 +103,6 @@ def inject_custom_css() -> None:
         }
         .badge-paid { background: #dcfce7; color: #166534; }
         .badge-trial { background: #fef9c3; color: #854d0e; }
-
-        [data-testid="stTextInput"] input,
-        [data-testid="stDataFrame"] {
-            direction: rtl;
-        }
         </style>
         """,
         unsafe_allow_html=True,
