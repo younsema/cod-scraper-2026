@@ -5,8 +5,9 @@ scraper.py
 
 الفكرة العامة:
 1. نكتشفو نوع المنصة (Shopify / YouCan / غير معروف).
-2. إلا كان رابط "صفحة منتج واحد" -> كنسحبو JSON-LD أو meta tags.
-3. إلا كان رابط "متجر / كولكسيون" -> كنجربو endpoint ديال Shopify (/products.json)
+2. نكتشفو شكل الرابط: صفحة منتج واحد، ولا صفحة متجر/كولكسيون.
+3. إلا كان رابط "صفحة منتج واحد" -> كنسحبو JSON-LD أو meta tags.
+4. إلا كان رابط "متجر / كولكسيون" -> كنجربو endpoint ديال Shopify (/products.json)
    أو كنقرأو صفحة الـ listing وكنسحبو الروابط ديال المنتجات ثم نزورهم واحد واحد.
 
 كل الدوال كترجع dict موحد بهاد الشكل:
@@ -20,6 +21,8 @@ scraper.py
 }
 """
 
+from __future__ import annotations
+
 import json
 import re
 import time
@@ -27,28 +30,60 @@ from urllib.parse import urljoin, urlparse
 
 import requests
 from bs4 import BeautifulSoup
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
         "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
-    )
+    ),
+    "Accept-Language": "ar,fr;q=0.8,en;q=0.6",
 }
 
 REQUEST_TIMEOUT = 15
 DELAY_BETWEEN_REQUESTS = 1.0  # ثانية، باش ما نضغطوش بزاف على السيرفر ديال الموقع
+DEFAULT_CURRENCY = "MAD"  # أغلب متاجر الـ COD المغربية كتخدم بالدرهم
+
+# عدد المحاولات فـ حالة فشل الطلب (timeout / 5xx) قبل ما نستسلمو
+MAX_RETRIES = 2
 
 
 class ScrapeError(Exception):
     pass
 
 
-def _get(url):
+def _build_session() -> requests.Session:
+    """كنبنيو Session وحدة كتعاود تستعمل نفس الكونيكسيون (أسرع)، مع retry أوتوماتيكي."""
+    session = requests.Session()
+    retry_strategy = Retry(
+        total=MAX_RETRIES,
+        backoff_factor=0.8,
+        status_forcelist=[429, 500, 502, 503, 504],
+        allowed_methods=["GET"],
+    )
+    adapter = HTTPAdapter(max_retries=retry_strategy)
+    session.mount("https://", adapter)
+    session.mount("http://", adapter)
+    session.headers.update(HEADERS)
+    return session
+
+
+# Session وحدة مشتركة بين كل الطلبات ديال هاد الموديول
+_SESSION = _build_session()
+
+
+def _get(url: str) -> requests.Response:
     """طلب GET آمن مع معالجة الأخطاء."""
     try:
-        resp = requests.get(url, headers=HEADERS, timeout=REQUEST_TIMEOUT)
+        resp = _SESSION.get(url, timeout=REQUEST_TIMEOUT)
         resp.raise_for_status()
         return resp
+    except requests.exceptions.Timeout:
+        raise ScrapeError(f"الموقع مادار بلا جاوب (Timeout): {url}")
+    except requests.exceptions.HTTPError as e:
+        status = e.response.status_code if e.response is not None else "?"
+        raise ScrapeError(f"الموقع رجع خطأ {status} فـ: {url}")
     except requests.exceptions.RequestException as e:
         raise ScrapeError(f"تعذر الوصول للرابط: {url} — {e}")
 
@@ -56,11 +91,21 @@ def _get(url):
 def detect_platform(html_text: str, url: str) -> str:
     """كنحاولو نعرفو شنو هي المنصة اعتمادا على محتوى الصفحة."""
     lower = html_text.lower()
-    if "cdn.shopify.com" in lower or "shopify" in lower or "myshopify.com" in url:
+    if "cdn.shopify.com" in lower or "myshopify.com" in url or "shopify" in lower:
         return "Shopify"
     if "youcan" in lower or "youcanbuild" in lower:
         return "YouCan"
     return "Unknown"
+
+
+def _is_single_product_url(url: str) -> bool:
+    """
+    كنحددو واش الرابط كايشير لـ صفحة منتج واحد بالضبط
+    (مثلا /products/some-handle) وماشي لصفحة متجر أو كولكسيون.
+    """
+    path = urlparse(url).path.rstrip("/")
+    # /products/<handle> أو /product/<handle> بغير سلاش زايدة من بعد
+    return bool(re.search(r"/products?/[^/]+$", path))
 
 
 def _extract_json_ld_product(soup: BeautifulSoup):
@@ -154,7 +199,7 @@ def scrape_single_product(url: str) -> dict:
     return {
         "title": (data.get("title") or "").strip(),
         "price": price_clean or "",
-        "currency": data.get("currency") or "",
+        "currency": data.get("currency") or DEFAULT_CURRENCY,
         "image": urljoin(url, data.get("image")) if data.get("image") else "",
         "url": url,
         "source": platform,
@@ -170,6 +215,7 @@ def get_shopify_products_json(store_url: str, max_products: int = 250) -> list:
     base = f"{parsed.scheme}://{parsed.netloc}"
 
     products = []
+    seen_urls = set()
     page = 1
     per_page = 50  # الحد الأقصى لـ Shopify فـ كل صفحة
 
@@ -189,13 +235,16 @@ def get_shopify_products_json(store_url: str, max_products: int = 250) -> list:
             title = p.get("title", "")
             handle = p.get("handle", "")
             product_url = f"{base}/products/{handle}"
+            if product_url in seen_urls:
+                continue
+            seen_urls.add(product_url)
+
             image = ""
             images = p.get("images", [])
             if images:
                 image = images[0].get("src", "")
 
             price = ""
-            currency = ""
             variants = p.get("variants", [])
             if variants:
                 price = variants[0].get("price", "")
@@ -204,12 +253,14 @@ def get_shopify_products_json(store_url: str, max_products: int = 250) -> list:
                 {
                     "title": title,
                     "price": price,
-                    "currency": currency,
+                    "currency": DEFAULT_CURRENCY,
                     "image": image,
                     "url": product_url,
                     "source": "Shopify",
                 }
             )
+            if len(products) >= max_products:
+                break
 
         page += 1
         time.sleep(DELAY_BETWEEN_REQUESTS)
@@ -249,8 +300,16 @@ def scrape_store(url: str, max_products: int = 60, progress_callback=None) -> li
     """
     resp = _get(url)
     platform = detect_platform(resp.text, url)
+    single_product_url = _is_single_product_url(url)
 
-    # 1) إلا كان Shopify -> نجربو /products.json مباشرة (الأسرع والأدق)
+    # 1) إلا كان رابط منتج واحد بالضبط (/products/<handle>) -> نسحبوه كمنتج وحيد
+    #    ماشي نجيبو المتجر كامل، حتى ولو المنصة Shopify.
+    if single_product_url:
+        if progress_callback:
+            progress_callback(1, 1, url)
+        return [scrape_single_product(url)]
+
+    # 2) إلا كان Shopify (رابط متجر / كولكسيون) -> نجربو /products.json مباشرة
     if platform == "Shopify":
         try:
             products = get_shopify_products_json(url, max_products=max_products)
@@ -259,7 +318,7 @@ def scrape_store(url: str, max_products: int = 60, progress_callback=None) -> li
         except ScrapeError:
             pass  # نكملو بالطريقة العادية إلا فشل
 
-    # 2) صفحة منتج واحد مباشرة (فيها JSON-LD ديال Product)
+    # 3) صفحة منتج واحد فيها JSON-LD ديال Product بدون ما يبان من شكل الرابط
     soup = BeautifulSoup(resp.text, "html.parser")
     single = _extract_json_ld_product(soup)
     looks_like_listing = len(soup.find_all("a", href=re.compile(r"/(product|products)/"))) > 3
@@ -267,7 +326,7 @@ def scrape_store(url: str, max_products: int = 60, progress_callback=None) -> li
     if single and not looks_like_listing:
         return [scrape_single_product(url)]
 
-    # 3) صفحة listing (كاتيغوري / متجر) -> نلقاطو الروابط ونزورهم واحد واحد
+    # 4) صفحة listing (كاتيغوري / متجر) -> نلقاطو الروابط ونزورهم واحد واحد
     links = discover_product_links(url, max_links=max_products)
     if not links:
         # ماكاينش روابط -> نعتبروها صفحة منتج واحد بأي حال
