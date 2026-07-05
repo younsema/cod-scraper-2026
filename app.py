@@ -1,156 +1,227 @@
-import streamlit as st
-import requests
+"""
+app.py
+------
+تطبيق Streamlit لسحب بيانات المنتجات من متاجر Shopify و YouCan
+وتصديرها كملف Excel منظم.
+
+نظام الحماية:
+- الأكواد المقبولة (VALID_KEYS) كتقرا من st.secrets، ماشي مكتوبة فالكود.
+- خاصك تزيدها فـ Streamlit Cloud > Settings > Secrets (شوف .streamlit/secrets.toml.example)
+"""
+
+from datetime import datetime, timedelta
+from io import BytesIO
+
 import pandas as pd
-from bs4 import BeautifulSoup
-import io
+import streamlit as st
 
-# 1. إعدادات وتسمية الصفحة
-st.set_page_config(page_title="COD Scraper Pro", page_icon="🚀", layout="centered")
+from scraper import ScrapeError, scrape_store
 
-# لستة الأكواد المقبولة (تقدر تبدلها أو تزيد فيها مستقبلاً)
-VALID_KEYS = ["TEST-FREE-00", "VIP-COD-2026", "USER-150DH"]
+# ---------------------------------------------------------------------------
+# إعدادات الصفحة
+# ---------------------------------------------------------------------------
+st.set_page_config(
+    page_title="أداة سحب بيانات المنافسين | COD Morocco",
+    page_icon="📦",
+    layout="centered",
+)
 
-# 2. نظام حماية الجلسة (قفل الموقع)
-if "authenticated" not in st.session_state:
-    st.session_state["authenticated"] = False
+MAX_PRODUCTS_DEFAULT = 60
 
-if not st.session_state["authenticated"]:
-    st.title("🔒 نظام سحب المنتجات - تسجيل الدخول")
-    st.write("مرحباً بك! يرجى إدخال كود التفعيل للولوج إلى الأداة.")
-    
-    access_key = st.text_input("كود التفعيل (Access Key):", type="password")
-    login_btn = st.button("تفعيل الدخول 🚀")
-    
-    if login_btn:
-        if access_key in VALID_KEYS:
+
+# ---------------------------------------------------------------------------
+# نظام الحماية (Gatekeeper)
+# ---------------------------------------------------------------------------
+def load_valid_keys() -> dict:
+    """
+    كنقراو الأكواد الصالحة من secrets.
+    الشكل المتوقع فـ secrets.toml:
+
+    [keys]
+    "TEST-FREE-00" = { type = "trial", expires = "2026-12-31", max_uses = 20 }
+    "CLIENT-AHMED-01" = { type = "paid", expires = "" , max_uses = 0 }
+
+    - type: "trial" ولا "paid"
+    - expires: تاريخ الانتهاء "YYYY-MM-DD"، ولا "" إلا كان بلا تاريخ نهاية
+    - max_uses: عدد مرات الاستعمال المسموحة للكود التجريبي (0 = بلا حدود)
+    """
+    if "keys" in st.secrets:
+        return dict(st.secrets["keys"])
+    return {}
+
+
+def is_key_valid(key: str, keys_db: dict) -> tuple[bool, str]:
+    if key not in keys_db:
+        return False, "الكود غير صحيح. تأكد من كتابته بشكل صحيح أو تواصل معنا."
+
+    info = keys_db[key]
+    expires = info.get("expires", "")
+    if expires:
+        try:
+            expiry_date = datetime.strptime(expires, "%Y-%m-%d")
+            if datetime.now() > expiry_date:
+                return False, "هذا الكود انتهت صلاحيته."
+        except ValueError:
+            pass
+
+    return True, ""
+
+
+def gatekeeper():
+    """شاشة الدخول: كتطلب كود التفعيل قبل عرض الأداة."""
+    st.markdown(
+        "<h2 style='text-align:center;'>🔒 أداة سحب بيانات المنتجات</h2>",
+        unsafe_allow_html=True,
+    )
+    st.markdown(
+        "<p style='text-align:center; color:gray;'>أدخل كود التفعيل ديالك للمتابعة</p>",
+        unsafe_allow_html=True,
+    )
+
+    key_input = st.text_input("كود التفعيل (Access Key)", type="password")
+    col1, col2 = st.columns([1, 1])
+    with col1:
+        submit = st.button("دخول ✅", use_container_width=True)
+
+    if submit:
+        keys_db = load_valid_keys()
+        valid, message = is_key_valid(key_input.strip(), keys_db)
+        if valid:
             st.session_state["authenticated"] = True
-            st.success("تم التفعيل بنجاح! جاري تحويلك...")
+            st.session_state["active_key"] = key_input.strip()
+            st.session_state["key_type"] = keys_db[key_input.strip()].get("type", "trial")
             st.rerun()
         else:
-            st.error("الكود غير صحيح! يرجى التواصل مع الدعم للحصول على كود شغّال.")
-    st.stop()
+            st.error(message)
 
-# -------------------------------------------------------------
-# الواجهة الرئيسية (كتظهر فقط يلا كان الكود صحيح)
-# -------------------------------------------------------------
+    st.markdown("---")
+    st.caption(
+        "ماعندكش كود؟ تواصل معنا فـ صفحة الفيسبوك أو الواتساب باش تجرب الأداة مجانا."
+    )
 
-st.title("🚀 COD Product Scraper")
-st.subheader("اسحب منتجات منافسيك في أقل من دقيقة وحولها لملف Excel منظم")
 
-# زر تسجيل الخروج ف الجنب
-if st.sidebar.button("تسجيل الخروج 🚪"):
-    st.session_state["authenticated"] = False
-    st.rerun()
+# ---------------------------------------------------------------------------
+# تصدير Excel
+# ---------------------------------------------------------------------------
+def to_excel_bytes(df: pd.DataFrame) -> bytes:
+    """كنحولو DataFrame لملف Excel (bytes) بترميز متوافق مع العربية."""
+    buffer = BytesIO()
+    with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
+        df.to_excel(writer, index=False, sheet_name="Products")
+        worksheet = writer.sheets["Products"]
+        # عرض تلقائي للأعمدة
+        for i, col in enumerate(df.columns):
+            max_len = max(df[col].astype(str).map(len).max(), len(col)) + 4
+            worksheet.column_dimensions[chr(65 + i)].width = min(max_len, 60)
+    return buffer.getvalue()
 
-# خانات إدخال البيانات للزبون
-target_url = st.text_input("ضع رابط المتجر المنافس هنا (مثال: https://store.com):")
-platform = st.selectbox("نوع المنصة:", ["Shopify", "YouCan"])
 
-def scrape_shopify(url):
-    if not url.endswith("/"):
-        url += "/"
-    json_url = f"{url}products.json?limit=50"
-    
-    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
-    response = requests.get(json_url, headers=headers)
-    
-    if response.status_code != 200:
-        return None
-        
-    data = response.json()
-    products_list = []
-    
-    for prod in data.get("products", []):
-        title = prod.get("title")
-        handle = prod.get("handle")
-        prod_url = f"{url}products/{handle}"
-        
-        images = prod.get("images", [])
-        image_url = images[0].get("src") if images else "لا توجد صورة"
-        
-        variants = prod.get("variants", [])
-        price = variants[0].get("price") if variants else "غير محدد"
-        
-        products_list.append({
-            "العنوان": title,
-            "الثمن": price,
-            "رابط الصورة": image_url,
-            "رابط المنتج": prod_url
-        })
-    return products_list
+# ---------------------------------------------------------------------------
+# الواجهة الرئيسية (بعد الدخول)
+# ---------------------------------------------------------------------------
+def main_app():
+    st.markdown(
+        "<h2 style='text-align:center;'>📦 أداة سحب بيانات المنتجات</h2>",
+        unsafe_allow_html=True,
+    )
+    st.markdown(
+        "<p style='text-align:center; color:gray;'>"
+        "دخل رابط منتج أو متجر (Shopify / YouCan) وسحب البيانات فـ ثواني</p>",
+        unsafe_allow_html=True,
+    )
 
-def scrape_youcan(url):
-    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
-    if "/products" not in url:
-        if not url.endswith("/"): url += "/"
-        url += "products"
-        
-    response = requests.get(url, headers=headers)
-    if response.status_code != 200:
-        return None
-        
-    soup = BeautifulSoup(response.text, 'html.parser')
-    products_list = []
-    
-    items = soup.find_all('div', class_='product-item') or soup.find_all('div', class_='product')
-    
-    for item in items:
+    with st.sidebar:
+        st.success(f"✅ تم الدخول بنجاح")
+        st.caption(f"نوع الكود: {st.session_state.get('key_type', 'trial')}")
+        if st.button("تسجيل الخروج 🚪"):
+            st.session_state.clear()
+            st.rerun()
+
+    st.markdown("### 1️⃣ أدخل الرابط")
+    url = st.text_input(
+        "رابط المنتج أو المتجر",
+        placeholder="https://example-store.com/products/some-product",
+    )
+
+    max_products = st.slider(
+        "أقصى عدد من المنتجات (فـ حالة رابط متجر/كاتيغوري)",
+        min_value=5,
+        max_value=200,
+        value=MAX_PRODUCTS_DEFAULT,
+        step=5,
+    )
+
+    scrape_clicked = st.button("🚀 سحب البيانات", type="primary", use_container_width=True)
+
+    if scrape_clicked:
+        if not url or not url.startswith("http"):
+            st.error("خاصك تدخل رابط صحيح يبدأ بـ http:// أو https://")
+            return
+
+        progress_bar = st.progress(0, text="جاري السحب...")
+        status_text = st.empty()
+
+        def update_progress(current, total, message):
+            pct = int((current / total) * 100) if total else 0
+            progress_bar.progress(min(pct, 100), text=f"تم سحب {current}/{total} منتج")
+            status_text.caption(message)
+
         try:
-            title_tag = item.find('h3') or item.find('h2') or item.find('a', class_='title')
-            title = title_tag.text.strip() if title_tag else "منتج بدون عنوان"
-            
-            link_tag = item.find('a')
-            prod_url = link_tag['href'] if link_tag else url
-            if prod_url.startswith('/'):
-                prod_url = url.split('/products')[0] + prod_url
-                
-            price_tag = item.find('span', class_='price') or item.find('div', class_='price')
-            price = price_tag.text.strip() if price_tag else "غير محدد"
-            
-            img_tag = item.find('img')
-            image_url = img_tag['src'] if img_tag else "لا توجد صورة"
-            
-            products_list.append({
-                "العنوان": title,
-                "الثمن": price,
-                "رابط الصورة": image_url,
-                "رابط المنتج": prod_url
-            })
+            with st.spinner("كنسحبو البيانات، صبر شوية..."):
+                products = scrape_store(
+                    url, max_products=max_products, progress_callback=update_progress
+                )
+        except ScrapeError as e:
+            st.error(f"⚠️ وقع مشكل: {e}")
+            return
         except Exception as e:
-            continue
-            
-    return products_list
+            st.error(f"⚠️ وقع مشكل غير متوقع: {e}")
+            return
 
-# زر تشغيل السكرايبر
-if st.button("ابدأ السحب الآن ⚡"):
-    if not target_url:
-        st.warning("المرجو إدخال رابط أولاً!")
+        progress_bar.empty()
+        status_text.empty()
+
+        if not products:
+            st.warning("ما لقيناش شي منتج فهاد الرابط. تأكد من الرابط وعاود جرب.")
+            return
+
+        df = pd.DataFrame(products)
+        df = df.rename(
+            columns={
+                "title": "العنوان",
+                "price": "الثمن",
+                "currency": "العملة",
+                "image": "رابط الصورة",
+                "url": "رابط المنتج",
+                "source": "المصدر",
+            }
+        )
+
+        st.success(f"✅ تم سحب {len(df)} منتج بنجاح!")
+        st.dataframe(df, use_container_width=True, hide_index=True)
+
+        excel_bytes = to_excel_bytes(df)
+        st.download_button(
+            label="⬇️ تحميل ملف Excel",
+            data=excel_bytes,
+            file_name=f"products_{datetime.now().strftime('%Y%m%d_%H%M')}.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            use_container_width=True,
+        )
+
+
+# ---------------------------------------------------------------------------
+# نقطة الدخول
+# ---------------------------------------------------------------------------
+def main():
+    if "authenticated" not in st.session_state:
+        st.session_state["authenticated"] = False
+
+    if not st.session_state["authenticated"]:
+        gatekeeper()
     else:
-        with st.spinner("جاري جلب البيانات وتحليل المتجر..."):
-            try:
-                if platform == "Shopify":
-                    results = scrape_shopify(target_url)
-                else:
-                    results = scrape_youcan(target_url)
-                
-                if results:
-                    df = pd.DataFrame(results)
-                    st.success(f"🎉 تم سحب {len(df)} منتج بنجاح!")
-                    
-                    st.dataframe(df)
-                    
-                    # تحويل البيانات لملف Excel يقبل العربية بوضوح
-                    towrite = io.BytesIO()
-                    df.to_excel(towrite, index=False, header=True, engine='openpyxl')
-                    towrite.seek(0)
-                    
-                    st.download_button(
-                        label="📥 تحميل ملف Excel المنظم",
-                        data=towrite,
-                        file_name="cod_products_extracted.xlsx",
-                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-                    )
-                else:
-                    st.error("لم نتمكن من سحب البيانات. تأكد من الرابط أو نوع المنصة.")
-            except Exception as e:
-                st.error(f"حدث خطأ غير متوقع: {e}")
+        main_app()
+
+
+if __name__ == "__main__":
+    main()
